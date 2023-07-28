@@ -19,7 +19,6 @@ using Rebus.Config;
 using Rebus.Exceptions;
 using Rebus.Internals;
 using Headers = Rebus.Messages.Headers;
-using System.Net;
 // ReSharper disable AccessToDisposedClosure
 
 // ReSharper disable EmptyGeneralCatchClause
@@ -29,6 +28,7 @@ using System.Net;
 
 #pragma warning disable 1998
 
+#nullable enable
 namespace Rebus.RabbitMq;
 
 /// <summary>
@@ -46,7 +46,7 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
     readonly SemaphoreSlim _consumerLock = new(1, 1);
     readonly ModelObjectPool _writerPool;
 
-    CustomQueueingConsumer _consumer;
+    CustomQueueingConsumer? _consumer = null;
 
     readonly ConcurrentDictionary<FullyQualifiedRoutingKey, bool> _verifiedQueues = new();
 
@@ -71,7 +71,7 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
     RabbitMqQueueOptionsBuilder _defaultQueueOptions = new();
     RabbitMqExchangeOptionsBuilder _inputExchangeOptions = new();
 
-    RabbitMqTransport(IRebusLoggerFactory rebusLoggerFactory, int maxMessagesToPrefetch, string inputQueueAddress) :
+    private RabbitMqTransport(IRebusLoggerFactory rebusLoggerFactory, int maxMessagesToPrefetch, string inputQueueAddress) :
         base(inputQueueAddress)
     {
         if (rebusLoggerFactory == null) throw new ArgumentNullException(nameof(rebusLoggerFactory));
@@ -85,6 +85,8 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
         _log = rebusLoggerFactory.GetLogger<RabbitMqTransport>();
 
         _writerPool = new ModelObjectPool(new WriterModelPoolPolicy(this), 5);
+        // Always initialized by one of the public constructors
+        _connectionManager = null!;
     }
 
     /// <summary>
@@ -93,7 +95,7 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
     /// </summary>
     public RabbitMqTransport(IList<ConnectionEndpoint> endpoints, string inputQueueAddress,
         IRebusLoggerFactory rebusLoggerFactory, int maxMessagesToPrefetch = 50,
-        Func<IConnectionFactory, IConnectionFactory> customizer = null)
+        Func<IConnectionFactory, IConnectionFactory>? customizer = null)
         : this(rebusLoggerFactory, maxMessagesToPrefetch, inputQueueAddress)
     {
         if (endpoints == null) throw new ArgumentNullException(nameof(endpoints));
@@ -107,7 +109,7 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
     /// </summary>
     public RabbitMqTransport(string connectionString, string inputQueueAddress,
         IRebusLoggerFactory rebusLoggerFactory, int maxMessagesToPrefetch = 50,
-        Func<IConnectionFactory, IConnectionFactory> customizer = null)
+        Func<IConnectionFactory, IConnectionFactory>? customizer = null)
         : this(rebusLoggerFactory, maxMessagesToPrefetch, inputQueueAddress)
     {
         if (connectionString == null) throw new ArgumentNullException(nameof(connectionString));
@@ -418,8 +420,9 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
 
             _writerPool.Return(model);
         }
-        catch (Exception)
+        catch (Exception e)
         {
+            _log.Warn(e, "An error occurred when sending messages - will dispose model");
             // if anything goes wrong when using this IModel, just drop it
             model.SafeDrop();
             throw;
@@ -448,32 +451,109 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
     bool _blockOnReceive = true;
 
     /// <inheritdoc />
-    public override async Task<TransportMessage> Receive(ITransactionContext context, CancellationToken cancellationToken)
+    public override async Task<TransportMessage?> Receive(ITransactionContext context, CancellationToken cancellationToken)
     {
         if (Address == null)
         {
             throw new InvalidOperationException("This RabbitMQ transport does not have an input queue - therefore, it is not possible to receive anything");
         }
 
+        CustomQueueingConsumer? consumer = null;
         try
         {
-            if (_consumer == null)
+            consumer = await InitializeAndGetConsumer(cancellationToken);
+            if (consumer == null)
             {
-                await _consumerLock.WaitAsync(cancellationToken);
-                try
+                return null;
+            }
+
+            BasicDeliverEventArgs result;
+
+            try
+            {
+                if (_blockOnReceive)
                 {
-                    _consumer ??= InitializeConsumer();
+                    result = await consumer.Queue.Reader.ReadAsync(cancellationToken);
                 }
-                finally
+                else
                 {
-                    _consumerLock.Release();
+                    // alternative way of receiving to fit in with Rebus' contract tests
+                    using var timeout = new CancellationTokenSource(millisecondsDelay: 2000);
+                    using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, cancellationToken);
+                    var combinedCancellationToken = linkedTokenSource.Token;
+                    try
+                    {
+                        result = await consumer.Queue.Reader.ReadAsync(combinedCancellationToken);
+                    }
+                    catch (OperationCanceledException) when (combinedCancellationToken.IsCancellationRequested)
+                    {
+                        return null;
+                    }
                 }
             }
+            catch (ChannelClosedException e)
+            {
+                _log.Warn(e, "Closed channel detected - consumer will be disposed");
+                consumer.Dispose();
+                return null;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                _log.Debug("Reading from queue was cancelled");
+                return null;
+            }
+
+            if (result == null) return null;
+
+            var deliveryTag = result.DeliveryTag;
+
+            context.OnCompleted(async _ => { consumer.Model.BasicAck(deliveryTag, multiple: false); });
+
+            context.OnAborted(_ =>
+            {
+                // we might not be able to do this, but it doesn't matter that much if it succeeds
+                try
+                {
+                    consumer.Model.BasicNack(deliveryTag, multiple: false, requeue: true);
+                }
+                catch
+                {
+                }
+            });
+
+            return CreateTransportMessage(result.BasicProperties, result.Body.ToArray());
+        }
+        catch (EndOfStreamException)
+        {
+            return null;
+        }
+        catch (ChannelClosedException e)
+        {
+            _log.Warn(e, "Though it was possible to receive, but the channel turned out to be closed... it will be renewed after a short wait");
+            consumer?.Dispose();
+            await Task.Delay(30000, cancellationToken);
+            return null;
+        }
+        catch (Exception exception)
+        {
+            await Task.Delay(1000, cancellationToken);
+
+            throw new RebusApplicationException(exception,
+                $"Unexpected exception thrown while trying to dequeue a message from rabbitmq, queue address: {Address}");
+        }
+    }
+
+    private async Task<CustomQueueingConsumer?> InitializeAndGetConsumer(CancellationToken cancellationToken)
+    {
+        await _consumerLock.WaitAsync(cancellationToken);
+        try
+        {
+            _consumer ??= InitializeConsumer();
 
             try
             {
                 // When a consumer is dequeued from the the "consumers" pool, it might be bound to a queue, which does not exist anymore,
-                // eg. expired and deleted by RabittMQ server policy). In this case this calling QueueDeclarePassive will result in 
+                // eg. expired and deleted by RabbitMQ server policy). In this case this calling QueueDeclarePassive will result in 
                 // an OperationInterruptedException and "consumer.Model.IsOpen" will be set to false (this is handled later in the code by 
                 // disposing this consumer). There is no need to handle this exception. The logic of InitializeConsumer() will make sure 
                 // that the queue is recreated later based on assumption about how ReBus is handling null-result of ITransport.Receive().
@@ -495,86 +575,17 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
 
             if (!_consumer.Model.IsOpen)
             {
+                _log.Warn("Consumer model is not open - consumer will be disposed: {0}", _consumer.Model.CloseReason);
                 _consumer.Dispose();
                 _consumer = null;
                 return null;
             }
 
-            BasicDeliverEventArgs result;
-
-            try
-            {
-                if (_blockOnReceive)
-                {
-                    result = await _consumer.Queue.Reader.ReadAsync(cancellationToken);
-                }
-                else
-                {
-                    // alternative way of receiving to fit in with Rebus' contract tests
-                    using var timeout = new CancellationTokenSource(millisecondsDelay: 2000);
-                    using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, cancellationToken);
-                    var combinedCancellationToken = linkedTokenSource.Token;
-                    try
-                    {
-                        result = await _consumer.Queue.Reader.ReadAsync(combinedCancellationToken);
-                    }
-                    catch (OperationCanceledException) when (combinedCancellationToken.IsCancellationRequested)
-                    {
-                        return null;
-                    }
-                }
-            }
-            catch (ChannelClosedException)
-            {
-                _log.Warn("Closed channel detected - consumer will be disposed");
-                _consumer?.Dispose();
-                _consumer = null;
-                return null;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                _log.Debug("Reading from queue was cancelled");
-                return null;
-            }
-
-            if (result == null) return null;
-
-            var deliveryTag = result.DeliveryTag;
-
-            context.OnCompleted(async _ => { _consumer.Model.BasicAck(deliveryTag, multiple: false); });
-
-            context.OnAborted(_ =>
-            {
-                // we might not be able to do this, but it doesn't matter that much if it succeeds
-                try
-                {
-                    _consumer.Model.BasicNack(deliveryTag, multiple: false, requeue: true);
-                }
-                catch
-                {
-                }
-            });
-
-            return CreateTransportMessage(result.BasicProperties, result.Body.ToArray());
+            return _consumer;
         }
-        catch (EndOfStreamException)
+        finally
         {
-            return null;
-        }
-        catch (ChannelClosedException)
-        {
-            _log.Warn("Though it was possible to receive, but the channel turned out to be closed... it will be renewed after a short wait");
-            _consumer?.Dispose();
-            _consumer = null;
-            await Task.Delay(30000, cancellationToken);
-            return null;
-        }
-        catch (Exception exception)
-        {
-            await Task.Delay(1000, cancellationToken);
-
-            throw new RebusApplicationException(exception,
-                $"Unexpected exception thrown while trying to dequeue a message from rabbitmq, queue address: {Address}");
+            _consumerLock.Release();
         }
     }
 
@@ -606,7 +617,7 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
                 return HeaderValueEncoding.GetString(headerValueBytes);
             }
 
-            return headerValue?.ToString();
+            return headerValue?.ToString()!;
         }
 
         var headers = basicProperties.Headers?.ToDictionary(kvp => kvp.Key, GetStringValue)
@@ -645,7 +656,7 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
 
     static string GenerateMessageIdFromBodyContents(byte[] body)
     {
-        if (body == null) return "MESSAGE-BODY-IS-NULL";
+        if (body == null!) return "MESSAGE-BODY-IS-NULL";
 
         var base64String = Convert.ToBase64String(body);
 
@@ -664,15 +675,21 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
     /// <summary>
     /// Creates the consumer.
     /// </summary>
-    CustomQueueingConsumer InitializeConsumer()
+    CustomQueueingConsumer? InitializeConsumer()
     {
-        IModel model = null;
+        IModel? model = null;
         try
         {
             model = CreateChannel();
             model.BasicQos(prefetchSize: 0, prefetchCount: _maxMessagesToPrefetch, global: false);
 
             var consumer = new CustomQueueingConsumer(model);
+            consumer.ConsumerCancelled += (_, args) =>
+            {
+                _log.Info("Consumer was cancelled - consumer tag: {consumerTag}", string.Join(";", args.ConsumerTags));
+                consumer.Dispose();
+                consumer = null;
+            };
 
             model.BasicConsume(queue: Address, autoAck: false, consumer: consumer);
 
@@ -881,7 +898,7 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
             }
         }
 
-        return (contentTypeResult, charsetResult);
+        return (contentTypeResult, charsetResult!);
     }
 
     void EnsureQueueExists(FullyQualifiedRoutingKey routingKey, IModel model)

@@ -5,12 +5,16 @@ using System.Threading.Channels;
 
 namespace Rebus.Internals;
 
-class CustomQueueingConsumer : DefaultBasicConsumer
+sealed class CustomQueueingConsumer : DefaultBasicConsumer
 {
     public Channel<BasicDeliverEventArgs> Queue { get; } = Channel.CreateUnbounded<BasicDeliverEventArgs>();
         
     public CustomQueueingConsumer(IModel model) : base(model)
     {
+        if (model == null)
+        {
+            throw new ArgumentNullException(nameof(model));
+        }
     }
 
     public override void HandleBasicDeliver(string consumerTag, ulong deliveryTag, bool redelivered, string exchange, string routingKey, IBasicProperties properties, ReadOnlyMemory<byte> body)
@@ -35,8 +39,13 @@ class CustomQueueingConsumer : DefaultBasicConsumer
         Queue.Writer.TryComplete();
     }
 
+
+    private bool _disposed;
+    
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
         Model.SafeDrop();
         Queue.Writer.TryComplete();
     }
