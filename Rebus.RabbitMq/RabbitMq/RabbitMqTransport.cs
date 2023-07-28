@@ -409,6 +409,12 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
 
         var model = _writerPool.Get();
 
+        while (model.IsClosed)
+        {
+            _log.Info("Got closed model when sending messages: {}", model.CloseReason);
+            model = _writerPool.Get();
+        }
+
         try
         {
             var expressMessages = messages.Where(m => m.IsExpress).Select(m => m.Message).ToList();
