@@ -5,6 +5,7 @@ using System.Threading.Channels;
 
 namespace Rebus.Internals;
 
+#nullable enable
 sealed class CustomQueueingConsumer : DefaultBasicConsumer
 {
     public Channel<BasicDeliverEventArgs> Queue { get; } = Channel.CreateUnbounded<BasicDeliverEventArgs>();
@@ -48,5 +49,17 @@ sealed class CustomQueueingConsumer : DefaultBasicConsumer
         _disposed = true;
         Model.SafeDrop();
         Queue.Writer.TryComplete();
+    }
+
+    public string? GetClosedReason()
+    {
+        try
+        {
+            return Model?.CloseReason?.ToString();
+        }
+        catch
+        {
+            return "Unknown close reason";
+        }
     }
 }

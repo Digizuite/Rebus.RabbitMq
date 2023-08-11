@@ -28,3 +28,4 @@ _NCrunch_*
 !**/packages/build/
 
 AssemblyInfo_Patch.cs
+publish.sh

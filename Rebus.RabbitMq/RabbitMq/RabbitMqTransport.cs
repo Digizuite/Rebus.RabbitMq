@@ -581,7 +581,8 @@ public class RabbitMqTransport : AbstractRebusTransport, IDisposable, IInitializ
 
             if (!_consumer.Model.IsOpen)
             {
-                _log.Warn("Consumer model is not open - consumer will be disposed: {0}", _consumer.Model.CloseReason);
+                _log.Warn("Consumer model is not open - consumer will be disposed: {0}", _consumer.GetClosedReason());
+
                 _consumer.Dispose();
                 _consumer = null;
                 return null;
